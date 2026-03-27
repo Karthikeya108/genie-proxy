@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:docs.databricks.com)",
+      "WebSearch",
+      "WebFetch(domain:community.databricks.com)"
+    ]
+  }
+}

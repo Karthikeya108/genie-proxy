@@ -1,0 +1,1 @@
+command: ["uvicorn", "genie_proxy.backend.app:app", "--workers", "2"]

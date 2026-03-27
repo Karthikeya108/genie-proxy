@@ -1,0 +1,32 @@
+bundle:
+  name: "genie-proxy"
+
+sync:
+  include:
+    - .build
+
+artifacts:
+  default:
+    build: apx build
+
+resources:
+  database_instances:
+    genie-proxy-db:
+      name: "genie-proxy"
+      capacity: "CU_1"
+  apps:
+    genie-proxy-app:
+      name: "genie-proxy"
+      description: "genie-proxy created with apx"
+      source_code_path: ./.build
+      resources:
+        - name: "db"
+          database:
+            database_name: "databricks_postgres"
+            instance_name: ${resources.database_instances.genie-proxy-db.name}
+            permission: "CAN_CONNECT_AND_CREATE"
+
+targets:
+  dev:
+    mode: development
+    default: true
