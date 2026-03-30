@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from importlib import resources
 from pathlib import Path
 from typing import ClassVar
@@ -28,10 +29,23 @@ class AppConfig(BaseSettings):
         env_nested_delimiter="__",
     )
     app_name: str = Field(default=app_name)
+    workspace_url: str = Field(
+        default="",
+        description="Databricks workspace URL (e.g. https://adb-123.4.azuredatabricks.net)",
+    )
+    genie_space_ids: str = Field(
+        default="",
+        description="Comma-separated list of Genie Space IDs to expose (optional filter)",
+    )
 
     @property
     def static_assets_path(self) -> Path:
         return Path(str(resources.files(app_slug))).joinpath("__dist__")
+
+    @property
+    def workspace_url_resolved(self) -> str:
+        """Return the workspace URL, falling back to DATABRICKS_HOST env var."""
+        return self.workspace_url or os.environ.get("DATABRICKS_HOST", "")
 
     def __hash__(self) -> int:
         return hash(self.app_name)

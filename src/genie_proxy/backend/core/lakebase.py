@@ -52,12 +52,12 @@ def _build_engine_url(
     if dev_port:
         logger.info(f"Using local dev database at localhost:{dev_port}")
         username = "postgres"
-        password = os.environ.get("APX_DEV_DB_PWD")
-        if password is None:
-            raise ValueError(
-                "APX server didn't provide a password, please check the dev server logs"
-            )
-        return f"postgresql+psycopg://{username}:{password}@localhost:{dev_port}/postgres?sslmode=disable"
+        password = os.environ.get("APX_DEV_DB_PWD", "")
+        if password:
+            return f"postgresql+psycopg://{username}:{password}@localhost:{dev_port}/postgres?sslmode=disable"
+        else:
+            logger.warning("APX_DEV_DB_PWD not set, connecting to PGlite without password")
+            return f"postgresql+psycopg://{username}@localhost:{dev_port}/postgres?sslmode=disable"
 
     # Production mode: use Databricks Database
     logger.info(f"Using Databricks database instance: {db_config.instance_name}")
@@ -137,6 +137,9 @@ def validate_db(engine: Engine, db_config: DatabaseConfig) -> None:
 def initialize_models(engine: Engine) -> None:
     """Create all SQLModel tables."""
     logger.info("Initializing database models")
+    # Import models to ensure they are registered with SQLModel metadata
+    from ..models import QueuedRequest  # noqa: F401
+
     SQLModel.metadata.create_all(engine)
     logger.info("Database models initialized successfully")
 
@@ -155,7 +158,19 @@ class _LakebaseDependency(LifespanDependency):
         initialize_models(engine)
 
         app.state.engine = engine
+
+        # Initialize and start the queue worker
+        from ..queue_service import QueueService
+
+        queue_service = QueueService(engine, ws=ws)
+        app.state.queue_service = queue_service
+        queue_service.start_worker()
+        logger.info("Queue worker started")
+
         yield
+
+        queue_service.stop_worker()
+        logger.info("Queue worker stopped")
         engine.dispose()
 
     @staticmethod

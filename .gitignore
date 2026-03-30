@@ -20,21 +20,47 @@ dist
 
 # js-related
 node_modules/
+bun.lockb
+package-lock.json
 .tanstack
 
 # env files
 .env
 .env.local
 .env.*
+!.env_template
 
 # mac
 .DS_Store
 
-# DABs 
+# DABs
 .databricks
 
 # apx
 .apx/
+bunfig.toml
 
 # UI dist folder
 src/genie_proxy/__dist__/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Test / coverage
+.coverage
+htmlcov/
+.pytest_cache/
+
+# OS files
+Thumbs.db
+ehthumbs.db
+
+# Logs
+*.log
+
+# Claude plans (local only)
+.claude/plans/

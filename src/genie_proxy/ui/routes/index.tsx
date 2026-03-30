@@ -1,7 +1,7 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { Button } from "@/components/ui/button";
 import Navbar from "@/components/apx/navbar";
-import { User } from "lucide-react";
+import { Sparkles, ListOrdered, MessageSquare } from "lucide-react";
 import { BubbleBackground } from "@/components/backgrounds/bubble";
 
 export const Route = createFileRoute("/")({
@@ -11,52 +11,63 @@ export const Route = createFileRoute("/")({
 function Index() {
   return (
     <div className="relative h-screen w-screen overflow-hidden flex flex-col">
-      {/* Navbar */}
       <Navbar />
 
-      {/* Main content - 2 columns */}
       <main className="flex-1 grid md:grid-cols-2">
-        {/* Left column - Gradient only */}
         <BubbleBackground interactive />
 
-        {/* Right column - Content */}
         <div className="relative flex flex-col items-center justify-center p-8 md:p-12 border-l">
           <div className="max-w-lg space-y-8 text-center">
             <h1 className="text-5xl md:text-6xl lg:text-7xl font-bold">
-              Welcome to {__APP_NAME__}
+              Genie Proxy
             </h1>
+            <p className="text-lg text-muted-foreground">
+              Access Databricks Genie Spaces across workspaces with intelligent
+              request queuing for QPM rate limits.
+            </p>
 
-            <Button size="lg" asChild>
-              <Link to="/profile" className="flex items-center gap-2">
-                <User className="h-5 w-5" />
-                View <code>/profile</code>
-              </Link>
-            </Button>
-          </div>
+            <div className="flex flex-col sm:flex-row gap-4 justify-center">
+              <Button size="lg" asChild>
+                <Link to="/spaces" className="flex items-center gap-2">
+                  <Sparkles className="h-5 w-5" />
+                  Browse Spaces
+                </Link>
+              </Button>
+              <Button size="lg" variant="outline" asChild>
+                <Link to="/queue" className="flex items-center gap-2">
+                  <ListOrdered className="h-5 w-5" />
+                  Queue Monitor
+                </Link>
+              </Button>
+            </div>
 
-          {/* APX Card Button - Bottom Right */}
-          <a
-            href="https://github.com/databricks-solutions/apx"
-            target="_blank"
-            rel="noopener noreferrer"
-            className="absolute bottom-12 right-2 w-38 group"
-          >
-            <div className="flex items-center gap-3 px-4 py-3 rounded-lg border bg-card hover:bg-accent transition-colors">
-              <img
-                src="https://raw.githubusercontent.com/databricks-solutions/apx/refs/heads/main/assets/logo.svg"
-                className="h-8 w-8"
-                alt="apx logo"
-              />
-              <div className="flex flex-col items-start text-balance">
-                <span className="text-xs font-medium">Built with</span>
-                <span className="text-sm font-semibold">apx</span>
+            <div className="grid grid-cols-3 gap-4 pt-4">
+              <div className="text-center">
+                <Sparkles className="h-8 w-8 mx-auto mb-2 text-primary" />
+                <p className="text-sm font-medium">Multi-Space</p>
+                <p className="text-xs text-muted-foreground">
+                  Access multiple Genie Spaces
+                </p>
+              </div>
+              <div className="text-center">
+                <MessageSquare className="h-8 w-8 mx-auto mb-2 text-primary" />
+                <p className="text-sm font-medium">User Identity</p>
+                <p className="text-xs text-muted-foreground">
+                  Uses your permissions
+                </p>
+              </div>
+              <div className="text-center">
+                <ListOrdered className="h-8 w-8 mx-auto mb-2 text-primary" />
+                <p className="text-sm font-medium">Smart Queue</p>
+                <p className="text-xs text-muted-foreground">
+                  Lakebase-backed queuing
+                </p>
               </div>
             </div>
-          </a>
+          </div>
         </div>
       </main>
 
-      {/* Background */}
       <div className="absolute inset-0 -z-10 h-full w-full bg-background" />
     </div>
   );
