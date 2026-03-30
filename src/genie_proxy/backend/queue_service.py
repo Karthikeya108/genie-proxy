@@ -1,10 +1,12 @@
 """Queue service backed by Lakebase (PostgreSQL).
 
-Uses a rolling-window parallel processor per workspace. Each workspace gets
-an asyncio.Semaphore(5) — up to 5 requests process concurrently. The moment
-one finishes, the next pending request starts immediately (no polling delay).
+Uses a rolling-window parallel processor per workspace. Concurrency is enforced
+at the database level: at most `qpm_limit` (default 5) requests can be in
+PROCESSING state per workspace at any time. This works correctly across multiple
+uvicorn worker processes because the DB is the single source of truth.
 
-Uses SELECT FOR UPDATE SKIP LOCKED for reliable, concurrent-safe dequeuing.
+The moment one request completes, the next pending request starts immediately
+(FCFS). Uses SELECT FOR UPDATE SKIP LOCKED for reliable, concurrent-safe dequeuing.
 """
 
 from __future__ import annotations
@@ -31,14 +33,8 @@ class QueueService:
         self._qpm_limit = qpm_limit
         self._stop_event = asyncio.Event()
         self._new_work_event = asyncio.Event()
-        self._workspace_semaphores: dict[str, asyncio.Semaphore] = {}
         self._workspace_workers: dict[str, asyncio.Task] = {}
         self._manager_task: asyncio.Task | None = None
-
-    def _get_semaphore(self, workspace_url: str) -> asyncio.Semaphore:
-        if workspace_url not in self._workspace_semaphores:
-            self._workspace_semaphores[workspace_url] = asyncio.Semaphore(self._qpm_limit)
-        return self._workspace_semaphores[workspace_url]
 
     # --- Queue Operations ---
 
@@ -65,7 +61,7 @@ class QueueService:
             session.add(item)
             session.commit()
             session.refresh(item)
-            logger.info(f"Enqueued request {item.request_id} for {user_email}")
+            logger.info(f"Enqueued request {item.request_id} for {user_email} in space {space_id}")
         # Signal the manager that new work is available
         self._new_work_event.set()
         return item
@@ -100,12 +96,12 @@ class QueueService:
             stmt = stmt.offset(offset).limit(limit)
 
             items = list(session.exec(stmt).all())
-            total = session.exec(text(count_sql), params=params).scalar() or 0  # type: ignore[call-overload]
+            total = session.execute(text(count_sql), params).scalar() or 0
             return items, int(total)
 
     def get_queue_stats(self) -> dict[str, int]:
         with Session(self.engine) as session:
-            result = session.exec(
+            result = session.execute(
                 text("SELECT status, COUNT(*) as cnt FROM queued_requests GROUP BY status")
             )
             stats = {row[0]: row[1] for row in result}
@@ -119,7 +115,7 @@ class QueueService:
 
     def get_pending_position(self, request_id: str) -> int | None:
         with Session(self.engine) as session:
-            result = session.exec(
+            result = session.execute(
                 text("""
                     SELECT position FROM (
                         SELECT request_id,
@@ -129,25 +125,44 @@ class QueueService:
                     ) ranked
                     WHERE request_id = :req_id
                 """),
-                params={"status": QueueStatus.PENDING, "req_id": request_id},
+                {"status": QueueStatus.PENDING, "req_id": request_id},
             )
             row = result.first()
             return int(row[0]) if row else None
 
     def clear_queue(self) -> int:
         with Session(self.engine) as session:
-            result = session.exec(text("DELETE FROM queued_requests"))
-            count = result.rowcount  # type: ignore[union-attr]
+            result = session.execute(text("DELETE FROM queued_requests"))
+            count = result.rowcount or 0
             session.commit()
             return int(count)
 
-    # --- Atomic Claim (one at a time per worker) ---
+    # --- Atomic Claim (DB-enforced concurrency limit, FCFS) ---
 
     def _claim_one(self, workspace_url: str) -> QueuedRequest | None:
-        """Atomically claim the next pending request for a workspace."""
+        """Atomically claim the next pending request if under the concurrency limit.
+
+        The concurrency limit is enforced in the database so it works correctly
+        across multiple uvicorn worker processes. Only claims a request if the
+        number of PROCESSING requests for this workspace is below qpm_limit.
+        """
         now = datetime.now(timezone.utc)
         with Session(self.engine) as session:
-            result = session.exec(
+            # Check + claim in a single transaction
+            count_result = session.execute(
+                text("""
+                    SELECT COUNT(*) FROM queued_requests
+                    WHERE status = :processing AND workspace_url = :ws_url
+                """),
+                {"processing": QueueStatus.PROCESSING, "ws_url": workspace_url},
+            )
+            processing_count = count_result.scalar() or 0
+
+            if processing_count >= self._qpm_limit:
+                session.commit()
+                return None
+
+            result = session.execute(
                 text("""
                     UPDATE queued_requests
                     SET status = :processing, updated_at = :now, started_at = :now
@@ -162,7 +177,7 @@ class QueueService:
                     )
                     RETURNING id
                 """),
-                params={
+                {
                     "processing": QueueStatus.PROCESSING,
                     "pending": QueueStatus.PENDING,
                     "ws_url": workspace_url,
@@ -176,32 +191,33 @@ class QueueService:
             return session.get(QueuedRequest, row[0])
 
     def _get_pending_workspaces(self) -> list[str]:
+        """Get distinct workspace_urls that have pending work."""
         with Session(self.engine) as session:
-            result = session.exec(
+            result = session.execute(
                 text("""
                     SELECT DISTINCT workspace_url
                     FROM queued_requests
                     WHERE status = :pending AND attempt_count < max_attempts
                 """),
-                params={"pending": QueueStatus.PENDING},
+                {"pending": QueueStatus.PENDING},
             )
             return [row[0] for row in result.all()]
 
     def _recover_stuck_requests(self) -> int:
         with Session(self.engine) as session:
-            result = session.exec(
+            result = session.execute(
                 text("""
                     UPDATE queued_requests
                     SET status = :pending, updated_at = :now, started_at = NULL
                     WHERE status = :processing
                 """),
-                params={
+                {
                     "pending": QueueStatus.PENDING,
                     "processing": QueueStatus.PROCESSING,
                     "now": datetime.now(timezone.utc),
                 },
             )
-            count = result.rowcount  # type: ignore[union-attr]
+            count = result.rowcount or 0
             session.commit()
             return int(count)
 
@@ -234,15 +250,20 @@ class QueueService:
                 session.add(item)
                 session.commit()
 
-    # --- Rolling Window Workers ---
+    def _requeue_for_qpm(self, item_id: int) -> None:
+        """Requeue a request that hit QPM limit without incrementing attempt_count."""
+        now = datetime.now(timezone.utc)
+        with Session(self.engine) as session:
+            item = session.get(QueuedRequest, item_id)
+            if item:
+                item.status = QueueStatus.PENDING
+                item.started_at = None
+                item.updated_at = now
+                item.error_message = None
+                session.add(item)
+                session.commit()
 
-    def _get_fresh_token(self) -> str | None:
-        if self._ws:
-            try:
-                return self._ws.config.token
-            except Exception:
-                return None
-        return None
+    # --- Rolling Window Workers (DB-enforced concurrency per workspace) ---
 
     async def _process_one(self, item: QueuedRequest) -> None:
         logger.info(
@@ -250,7 +271,7 @@ class QueueService:
             f"space={item.space_name or item.space_id} "
             f"(attempt {item.attempt_count + 1}/{item.max_attempts})"
         )
-        token = self._get_fresh_token() or item.user_token
+        token = item.user_token
 
         try:
             svc = GenieService(workspace_url=item.workspace_url, user_token=token)
@@ -263,8 +284,8 @@ class QueueService:
             logger.info(f"Completed request {item.request_id}")
 
         except QPMLimitError:
-            logger.warning(f"QPM limit hit for {item.request_id}, re-queuing")
-            self._mark_failed(item.id, "QPM limit exceeded, will retry", requeue=True)  # type: ignore[arg-type]
+            logger.warning(f"QPM limit hit for {item.request_id}, re-queuing (no attempt penalty)")
+            self._requeue_for_qpm(item.id)  # type: ignore[arg-type]
 
         except GenieAPIError as e:
             logger.error(f"Genie API error for {item.request_id}: {e}")
@@ -277,47 +298,42 @@ class QueueService:
     async def _workspace_worker(self, workspace_url: str) -> None:
         """Persistent worker for a single workspace.
 
-        Loops: acquire semaphore → claim one request → process → release.
-        The semaphore ensures at most `qpm_limit` requests run concurrently.
-        When one finishes and releases the semaphore, the next waiting
-        iteration immediately acquires it — true rolling window with zero delay.
+        Concurrency is enforced in the DB: _claim_one() only returns a request
+        if fewer than qpm_limit requests are currently PROCESSING for this
+        workspace. This works correctly across multiple uvicorn worker processes.
+
+        When a request completes, it signals _new_work_event so the worker
+        immediately tries to claim the next pending request — true rolling window.
         """
-        sem = self._get_semaphore(workspace_url)
         logger.info(f"Workspace worker started for {workspace_url} (max {self._qpm_limit} concurrent)")
 
         while not self._stop_event.is_set():
-            # Wait for a concurrency slot
-            await sem.acquire()
-            try:
-                item = self._claim_one(workspace_url)
-                if item is None:
-                    # No pending work — release semaphore and wait for signal
-                    sem.release()
-                    # Wait until new work arrives or shutdown
-                    self._new_work_event.clear()
-                    try:
-                        await asyncio.wait_for(self._new_work_event.wait(), timeout=5.0)
-                    except asyncio.TimeoutError:
-                        pass
-                    continue
+            item = self._claim_one(workspace_url)
 
-                # Process in a new task so we can immediately loop back
-                # and acquire the semaphore for the next request
-                async def _run(item: QueuedRequest = item) -> None:
-                    try:
-                        await self._process_one(item)
-                    finally:
-                        sem.release()
+            if item is None:
+                # Either at concurrency limit or no pending work — wait for signal
+                self._new_work_event.clear()
+                try:
+                    await asyncio.wait_for(self._new_work_event.wait(), timeout=3.0)
+                except asyncio.TimeoutError:
+                    pass
+                continue
 
-                asyncio.create_task(_run())
-            except Exception:
-                sem.release()
-                raise
+            # Process in a background task so we can immediately try to
+            # claim the next request (up to the DB-enforced limit)
+            async def _run(item: QueuedRequest = item) -> None:
+                try:
+                    await self._process_one(item)
+                finally:
+                    # Signal that a slot freed up
+                    self._new_work_event.set()
+
+            asyncio.create_task(_run())
 
         logger.info(f"Workspace worker stopped for {workspace_url}")
 
     async def _manager_loop(self) -> None:
-        """Manager loop: discovers workspaces and spawns per-workspace workers."""
+        """Manager loop: discovers workspaces with pending work and spawns per-workspace workers."""
         logger.info(f"Queue manager started (rolling window, max {self._qpm_limit} concurrent per workspace)")
 
         recovered = self._recover_stuck_requests()

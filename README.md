@@ -11,11 +11,11 @@ flowchart TB
         UI["React Frontend<br/>(shadcn/ui + TanStack Router)"]
         API["FastAPI Backend<br/>(APX Framework)"]
         MGR["Queue Manager"]
-        subgraph "Rolling Window Workers (per workspace)"
-            W1["Worker 1"]
-            W2["Worker 2"]
+        subgraph "Rolling Window (DB-enforced, max 5)"
+            W1["Worker Task 1"]
+            W2["Worker Task 2"]
             W3["..."]
-            W5["Worker 5"]
+            W5["Worker Task 5"]
         end
     end
 
@@ -23,7 +23,7 @@ flowchart TB
         GS1["Genie Space 1"]
         GS2["Genie Space 2"]
         GSN["Genie Space N"]
-        LB["Lakebase<br/>(PostgreSQL - Autoscaling)"]
+        LB["Lakebase<br/>(PostgreSQL - Provisioned)"]
     end
 
     User["User<br/>(Browser)"] -->|"OBO Token"| UI
@@ -68,12 +68,12 @@ sequenceDiagram
         API->>LB: INSERT into queued_requests
         API-->>UI: 202 Accepted (request_id)
         UI-->>User: "Request queued"
-        Worker->>LB: SELECT ... FOR UPDATE SKIP LOCKED
+        Worker->>LB: Check PROCESSING count < 5, then SELECT ... FOR UPDATE SKIP LOCKED
         LB-->>Worker: Next pending request (FCFS)
         Worker->>Genie: Process with user token
         Genie-->>Worker: Response
         Worker->>LB: UPDATE status = completed
-        Note over Worker,LB: Semaphore released → next worker starts immediately
+        Note over Worker,LB: Slot freed → next pending starts immediately
     end
 ```
 
@@ -82,37 +82,51 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     participant Q as Queue (Lakebase)
-    participant S as Semaphore(5)
+    participant DB as DB Concurrency Gate
     participant W as Worker Pool
 
-    Note over Q,W: 10 requests queued, 5 slots available
+    Note over Q,W: 10 requests queued, DB enforces max 5 PROCESSING
 
-    Q->>S: Worker acquires slot 1
-    Q->>S: Worker acquires slot 2
-    Q->>S: Worker acquires slot 3
-    Q->>S: Worker acquires slot 4
-    Q->>S: Worker acquires slot 5
+    Q->>DB: Claim #1 (PROCESSING count: 0 < 5) ✓
+    Q->>DB: Claim #2 (PROCESSING count: 1 < 5) ✓
+    Q->>DB: Claim #3 (PROCESSING count: 2 < 5) ✓
+    Q->>DB: Claim #4 (PROCESSING count: 3 < 5) ✓
+    Q->>DB: Claim #5 (PROCESSING count: 4 < 5) ✓
 
-    Note over S: All 5 slots occupied
+    Note over DB: 5 PROCESSING — no more claims until one completes
 
-    S-->>W: Request #3 completes → slot released
-    Q->>S: Worker immediately acquires slot → starts Request #6
+    Q->>DB: Try claim #6 (count: 5 ≥ 5) ✗ wait...
 
-    S-->>W: Request #1 completes → slot released
-    Q->>S: Worker immediately acquires slot → starts Request #7
+    W-->>DB: Request #3 completes → PROCESSING count drops to 4
+    Q->>DB: Claim #6 (count: 4 < 5) ✓
 
-    Note over Q,W: No polling delay — instant handoff
+    W-->>DB: Request #1 completes → PROCESSING count drops to 4
+    Q->>DB: Claim #7 (count: 4 < 5) ✓
+
+    Note over Q,W: Works correctly across multiple uvicorn workers
 ```
+
+## Authentication Model
+
+| Operation | Identity | Method |
+|-----------|----------|--------|
+| Genie API calls (list spaces, conversations, messages, query results) | **User** | OBO token from `X-Forwarded-Access-Token` header |
+| Queued Genie requests (background processing) | **User** | Stored OBO token from original request |
+| Lakebase DB connections, credential generation | **Service Principal** | App SP via env vars (`DATABRICKS_CLIENT_ID`/`SECRET`) |
+| Queue management (enqueue, claim, stats) | **Service Principal** | App SP via DB engine |
+
+The user `WorkspaceClient` is created with an explicit `Config(host=..., token=...)` that sets `client_id=""` and `client_secret=""` to prevent the SDK from picking up the SP's env vars. No PAT tokens are used — only OAuth OBO tokens forwarded by the Databricks Apps platform.
 
 ## Features
 
 - **Multi-Space Access**: Browse and connect to multiple Genie Spaces across workspaces
-- **User Identity (OBO)**: All Genie API calls use the authenticated user's identity via On-Behalf-Of token passthrough, never the service principal
-- **Rolling Window Queue**: Up to 5 requests process concurrently per workspace (matching Genie API free tier QPM). When one finishes, the next starts immediately with zero delay
-- **Workspace-Level QPM**: Queue is managed per workspace across all Genie spaces, matching the Genie API's per-workspace rate limit model
-- **Queue Monitor**: Real-time dashboard with Current Run / History tabs, per-request timing (wait time + run time), and Genie space name badges
+- **User Identity (OBO)**: All Genie API calls use the authenticated user's identity via OAuth On-Behalf-Of token passthrough, never the service principal
+- **DB-Enforced Concurrency**: Max 5 queries execute concurrently per workspace, enforced in the database (not in-memory), so it works correctly across multiple uvicorn worker processes
+- **Rolling Window Queue**: When one of the 5 concurrent queries completes, the next pending request starts immediately with zero delay (FCFS)
+- **QPM Requeue**: If a 429/QPM limit error still occurs, the request is requeued without counting as a failed attempt — it stays pending until a slot opens
+- **Live Timers**: Queue monitor shows live-ticking wait time (while pending) and run time (while processing), freezing to final values on completion
+- **Queue Monitor**: Real-time dashboard with Current Run / History tabs, per-request timing, and Genie space name badges
 - **Queue Simulation**: Simulate queuing across multiple Genie spaces with round-robin distribution
-- **Clear Queue**: One-click clear of all queue items
 - **Atomic Dequeuing**: Uses PostgreSQL's `SELECT FOR UPDATE SKIP LOCKED` for reliable, concurrent-safe FCFS processing
 - **Crash Recovery**: On startup, stuck PROCESSING requests are automatically reset to PENDING
 
@@ -124,8 +138,8 @@ sequenceDiagram
 | Backend | Python 3.11+, FastAPI, SQLModel, httpx, asyncio |
 | Frontend | React 19, TypeScript, TanStack Router, TanStack React Query |
 | UI Components | [shadcn/ui](https://github.com/shadcn-ui/ui) (Radix + Tailwind) |
-| Database | Lakebase (Databricks managed PostgreSQL, Autoscaling) |
-| Auth | Databricks Apps OBO (On-Behalf-Of) token passthrough |
+| Database | Lakebase (Databricks managed PostgreSQL, Provisioned) |
+| Auth | Databricks Apps OAuth OBO (On-Behalf-Of) token passthrough |
 | Deployment | Databricks Asset Bundles |
 
 ## Project Structure
@@ -145,10 +159,10 @@ genie-proxy/
     │   ├── router.py           # API routes (Genie proxy + queue)
     │   ├── models.py           # SQLModel + Pydantic models
     │   ├── genie_service.py    # Genie Spaces API client (OBO)
-    │   ├── queue_service.py    # Rolling window queue + workspace workers
+    │   ├── queue_service.py    # Rolling window queue (DB-enforced concurrency)
     │   └── core/               # APX framework core
-    │       ├── _config.py      # App configuration
-    │       ├── _defaults.py    # WorkspaceClient dependencies
+    │       ├── _config.py      # App configuration + logging
+    │       ├── _defaults.py    # WorkspaceClient dependencies (SP + user OBO)
     │       ├── _headers.py     # OBO header extraction
     │       ├── lakebase.py     # DB engine + queue manager lifecycle
     │       └── dependencies.py # FastAPI DI shortcuts
@@ -160,7 +174,7 @@ genie-proxy/
         │       ├── route.tsx   # Sidebar layout + navigation
         │       ├── spaces.tsx  # Genie Space browser
         │       ├── chat.tsx    # Chat interface
-        │       ├── queue.tsx   # Queue monitor (tabs, timing, simulation)
+        │       ├── queue.tsx   # Queue monitor (live timers, simulation)
         │       └── profile.tsx # User profile
         ├── components/         # shadcn/ui + custom components
         ├── lib/
@@ -234,20 +248,22 @@ apx build
 # Deploy with Databricks Asset Bundles
 databricks bundle deploy -t dev
 
-# Run the app
-databricks bundle run genie-proxy-app -t dev
+# Deploy the app
+databricks apps deploy genie-proxy-app \
+  --source-code-path "/Workspace/Users/<your-email>/.bundle/genie-proxy/dev/files/.build"
 ```
 
 ## Queue Mechanism
 
-### Throughput Model
+### Concurrency Model
 
-The Genie API free tier allows **5 questions per minute per workspace** across all Genie spaces. The queue enforces this at the workspace level:
+The Genie API allows **5 questions per minute per workspace** across all Genie spaces. The queue enforces this at the workspace level using **database-enforced concurrency**:
 
-- Each workspace gets a pool of 5 concurrent worker slots (via `asyncio.Semaphore`)
-- Workers use FCFS (First Come, First Served) ordering
-- When one of the 5 finishes, the next pending request starts **immediately** (rolling window, no polling delay)
-- Different workspaces process independently and don't block each other
+- Before claiming a new request, the worker checks: `SELECT COUNT(*) FROM queued_requests WHERE status = 'processing' AND workspace_url = ?`
+- If the count is >= 5, no new request is claimed — the worker waits for a completion signal
+- This works correctly across **multiple uvicorn worker processes** because the database is the single source of truth (in-memory semaphores would allow 2 × 5 = 10 concurrent with `--workers 2`)
+- Workers use FCFS (First Come, First Served) ordering via `ORDER BY priority DESC, created_at ASC`
+- When one of the 5 completes, the worker is signaled and immediately claims the next pending request (rolling window, no polling delay)
 
 ### Queue Table Schema
 
@@ -277,9 +293,15 @@ CREATE TABLE queued_requests (
 
 ### Dequeue Pattern
 
-Uses PostgreSQL's `SELECT FOR UPDATE SKIP LOCKED` for atomic, concurrent-safe FCFS dequeuing scoped to workspace:
+Uses PostgreSQL's `SELECT FOR UPDATE SKIP LOCKED` for atomic, concurrent-safe FCFS dequeuing, with a DB-level concurrency check:
 
 ```sql
+-- Step 1: Check concurrency limit
+SELECT COUNT(*) FROM queued_requests
+WHERE status = 'processing' AND workspace_url = :workspace_url;
+-- If count >= 5, skip — wait for a slot to free up
+
+-- Step 2: Claim next pending (only if count < 5)
 UPDATE queued_requests
 SET status = 'processing', updated_at = NOW(), started_at = NOW()
 WHERE id = (
@@ -296,17 +318,23 @@ RETURNING id;
 
 ### Retry Logic
 
-- QPM limit errors: re-queued with incremented attempt count
-- Non-QPM API errors: marked as failed immediately
-- Unexpected errors: re-queued for retry
-- Maximum 5 attempts per request
-- Crash recovery: PROCESSING requests reset to PENDING on startup
+- **QPM limit errors (429)**: Requeued to PENDING **without incrementing attempt count** — the request stays in the queue indefinitely until it succeeds
+- **Non-QPM API errors**: Marked as failed immediately
+- **Unexpected errors**: Requeued with incremented attempt count (max 5 attempts)
+- **Crash recovery**: PROCESSING requests reset to PENDING on startup
 
 ## Environment Variables
 
 | Variable | Description | Required |
 |----------|-------------|----------|
-| `DATABRICKS_CONFIG_PROFILE` | Databricks CLI profile name | Yes |
-| `PGAPPNAME` | Lakebase database instance name | Yes |
+| `PGAPPNAME` | Lakebase provisioned database instance name | Yes |
 | `GENIE_PROXY_WORKSPACE_URL` | Databricks workspace URL | No (falls back to `DATABRICKS_HOST`) |
 | `GENIE_PROXY_GENIE_SPACE_IDS` | Comma-separated Genie Space IDs to expose | No (shows all accessible) |
+
+## User API Scopes
+
+The app requires these OAuth scopes configured in the Databricks App's Authorization tab:
+
+- `sql` — Execute SQL queries
+- `dashboards.genie` — Access Genie Spaces API
+- `serving.serving-endpoints` — Access serving endpoints

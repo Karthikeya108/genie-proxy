@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import asyncio
+from functools import partial
+
+from databricks.sdk import WorkspaceClient
 from fastapi import HTTPException, Request
 
 from .core import Dependencies, create_router
-from .core._config import AppConfig
+from .core._config import AppConfig, logger
 from .core._headers import DatabricksAppsHeaders
-from .genie_service import GenieService, GenieAPIError, QPMLimitError
 from .models import (
     ClearQueueOut,
     GenieConversationOut,
@@ -16,7 +19,6 @@ from .models import (
     QueuedResponseOut,
     QueueItemOut,
     QueueListOut,
-    QueueStatus,
     SendMessageRequest,
     SimulateQueueRequest,
     StartConversationRequest,
@@ -25,6 +27,9 @@ from .models import (
 from .queue_service import QueueService
 
 router = create_router()
+
+
+# --- Helpers ---
 
 
 def _get_queue_service(request: Request) -> QueueService:
@@ -43,20 +48,13 @@ def _get_workspace_url(config: AppConfig, headers: DatabricksAppsHeaders) -> str
     return url
 
 
-def _require_token(headers: DatabricksAppsHeaders, request: Request | None = None) -> str:
-    if headers.token:
-        return headers.token.get_secret_value()
-    # Fall back to app's WorkspaceClient token (local dev / CLI profile)
-    if request:
-        ws = request.app.state.workspace_client
-        token = ws.config.token
-        if token:
-            return token
-    raise HTTPException(status_code=401, detail="User authentication token not available")
+async def _run_sync(fn, *args, **kwargs):
+    """Run a blocking SDK call in a thread pool."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, partial(fn, *args, **kwargs))
 
 
 def _compute_timing(item) -> tuple[int | None, int | None]:
-    """Compute wait_time_ms and run_time_ms from timestamps."""
     wait_ms = None
     run_ms = None
     if item.started_at and item.created_at:
@@ -88,6 +86,21 @@ def _to_queue_item_out(item) -> QueueItemOut:
     )
 
 
+def _msg_to_dict(msg) -> dict:
+    """Convert a SDK GenieMessage to a serializable dict."""
+    attachments = []
+    if msg.attachments:
+        for att in msg.attachments:
+            attachments.append(att.as_dict() if hasattr(att, "as_dict") else {})
+    return {
+        "message_id": msg.id or "",
+        "conversation_id": msg.conversation_id or "",
+        "content": msg.content or "",
+        "status": msg.status.value if msg.status else "COMPLETED",
+        "attachments": attachments,
+    }
+
+
 # --- Version ---
 
 
@@ -109,31 +122,28 @@ def me(user_ws: Dependencies.UserClient):
 
 @router.get("/genie/spaces", response_model=GenieSpaceListOut, operation_id="listGenieSpaces")
 async def list_genie_spaces(
-    request: Request,
+    user_ws: Dependencies.UserClient,
     config: Dependencies.Config,
-    headers: Dependencies.Headers,
 ):
-    token = _require_token(headers, request)
-    workspace_url = _get_workspace_url(config, headers)
-    svc = GenieService(workspace_url=workspace_url, user_token=token)
-
+    """List Genie spaces visible to the current user."""
     try:
-        raw_spaces = await svc.list_spaces()
-    except GenieAPIError as e:
-        raise HTTPException(status_code=e.status_code, detail=e.detail)
+        result = await _run_sync(user_ws.genie.list_spaces)
+    except Exception as e:
+        logger.error(f"Failed to list Genie spaces: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
     allowed_ids = [s.strip() for s in config.genie_space_ids.split(",") if s.strip()]
 
     spaces = []
-    for s in raw_spaces:
-        sid = s.get("space_id") or s.get("id", "")
+    for s in result.spaces or []:
+        sid = s.space_id or ""
         if allowed_ids and sid not in allowed_ids:
             continue
         spaces.append(
             GenieSpaceInfo(
                 space_id=sid,
-                title=s.get("title", s.get("name", "Untitled")),
-                description=s.get("description"),
+                title=s.title or "Untitled",
+                description=s.description,
             )
         )
 
@@ -151,49 +161,54 @@ async def list_genie_spaces(
 async def start_conversation(
     space_id: str,
     body: StartConversationRequest,
-    config: Dependencies.Config,
+    user_ws: Dependencies.UserClient,
     headers: Dependencies.Headers,
+    config: Dependencies.Config,
     request: Request,
 ):
-    token = _require_token(headers, request)
-    workspace_url = _get_workspace_url(config, headers)
-    svc = GenieService(workspace_url=workspace_url, user_token=token)
-
+    """Start a new Genie conversation. Queues the request if QPM limit is hit."""
     try:
-        result = await svc.ask_question(space_id=space_id, question=body.question)
+        msg = await _run_sync(
+            user_ws.genie.start_conversation_and_wait, space_id, body.question
+        )
+        d = _msg_to_dict(msg)
         return GenieConversationOut(
-            conversation_id=result["conversation_id"],
+            conversation_id=d["conversation_id"],
             space_id=space_id,
             title=body.question,
             message=GenieMessageOut(
-                message_id=result["message_id"],
-                conversation_id=result["conversation_id"],
+                message_id=d["message_id"],
+                conversation_id=d["conversation_id"],
                 space_id=space_id,
-                content=result.get("content", body.question),
-                status=result["status"],
-                attachments=result.get("attachments"),
-                error=result.get("error"),
+                content=d["content"] or body.question,
+                status=d["status"],
+                attachments=d["attachments"],
+                error=None,
             ),
         )
-    except QPMLimitError:
-        qs = _get_queue_service(request)
-        item = qs.enqueue(
-            user_email=headers.user_email or "unknown",
-            user_token=token,
-            space_id=space_id,
-            workspace_url=workspace_url,
-            question=body.question,
-        )
-        raise HTTPException(
-            status_code=202,
-            detail={
-                "message": "QPM limit reached. Request has been queued.",
-                "request_id": item.request_id,
-                "status": "queued",
-            },
-        )
-    except GenieAPIError as e:
-        raise HTTPException(status_code=e.status_code, detail=e.detail)
+    except Exception as e:
+        err = str(e)
+        if "rate" in err.lower() or "limit" in err.lower():
+            qs = _get_queue_service(request)
+            workspace_url = _get_workspace_url(config, headers)
+            token = headers.token.get_secret_value() if headers.token else ""
+            item = qs.enqueue(
+                user_email=headers.user_email or "unknown",
+                user_token=token,
+                space_id=space_id,
+                workspace_url=workspace_url,
+                question=body.question,
+            )
+            raise HTTPException(
+                status_code=202,
+                detail={
+                    "message": "QPM limit reached. Request has been queued.",
+                    "request_id": item.request_id,
+                    "status": "queued",
+                },
+            )
+        logger.error(f"Genie start_conversation error: {e}")
+        raise HTTPException(status_code=500, detail=err)
 
 
 @router.post(
@@ -205,49 +220,53 @@ async def send_message(
     space_id: str,
     conversation_id: str,
     body: SendMessageRequest,
-    config: Dependencies.Config,
+    user_ws: Dependencies.UserClient,
     headers: Dependencies.Headers,
+    config: Dependencies.Config,
     request: Request,
 ):
-    token = _require_token(headers, request)
-    workspace_url = _get_workspace_url(config, headers)
-    svc = GenieService(workspace_url=workspace_url, user_token=token)
-
+    """Send a follow-up message. Queues the request if QPM limit is hit."""
     try:
-        result = await svc.ask_question(
-            space_id=space_id,
-            question=body.question,
-            conversation_id=conversation_id,
+        msg = await _run_sync(
+            user_ws.genie.create_message_and_wait,
+            space_id,
+            conversation_id,
+            body.question,
         )
+        d = _msg_to_dict(msg)
         return GenieMessageOut(
-            message_id=result["message_id"],
-            conversation_id=result["conversation_id"],
+            message_id=d["message_id"],
+            conversation_id=d["conversation_id"],
             space_id=space_id,
-            content=result.get("content", body.question),
-            status=result["status"],
-            attachments=result.get("attachments"),
-            error=result.get("error"),
+            content=d["content"] or body.question,
+            status=d["status"],
+            attachments=d["attachments"],
+            error=None,
         )
-    except QPMLimitError:
-        qs = _get_queue_service(request)
-        item = qs.enqueue(
-            user_email=headers.user_email or "unknown",
-            user_token=token,
-            space_id=space_id,
-            workspace_url=workspace_url,
-            question=body.question,
-            conversation_id=conversation_id,
-        )
-        raise HTTPException(
-            status_code=202,
-            detail={
-                "message": "QPM limit reached. Request has been queued.",
-                "request_id": item.request_id,
-                "status": "queued",
-            },
-        )
-    except GenieAPIError as e:
-        raise HTTPException(status_code=e.status_code, detail=e.detail)
+    except Exception as e:
+        err = str(e)
+        if "rate" in err.lower() or "limit" in err.lower():
+            qs = _get_queue_service(request)
+            workspace_url = _get_workspace_url(config, headers)
+            token = headers.token.get_secret_value() if headers.token else ""
+            item = qs.enqueue(
+                user_email=headers.user_email or "unknown",
+                user_token=token,
+                space_id=space_id,
+                workspace_url=workspace_url,
+                question=body.question,
+                conversation_id=conversation_id,
+            )
+            raise HTTPException(
+                status_code=202,
+                detail={
+                    "message": "QPM limit reached. Request has been queued.",
+                    "request_id": item.request_id,
+                    "status": "queued",
+                },
+            )
+        logger.error(f"Genie send_message error: {e}")
+        raise HTTPException(status_code=500, detail=err)
 
 
 @router.get(
@@ -259,27 +278,26 @@ async def get_message(
     space_id: str,
     conversation_id: str,
     message_id: str,
-    request: Request,
-    config: Dependencies.Config,
-    headers: Dependencies.Headers,
+    user_ws: Dependencies.UserClient,
 ):
-    token = _require_token(headers, request)
-    workspace_url = _get_workspace_url(config, headers)
-    svc = GenieService(workspace_url=workspace_url, user_token=token)
-
+    """Poll for message status."""
     try:
-        msg = await svc.get_message(space_id, conversation_id, message_id)
+        msg = await _run_sync(
+            user_ws.genie.get_message, space_id, conversation_id, message_id
+        )
+        d = _msg_to_dict(msg)
         return GenieMessageOut(
-            message_id=msg.get("id", message_id),
+            message_id=d["message_id"] or message_id,
             conversation_id=conversation_id,
             space_id=space_id,
-            content=msg.get("content", ""),
-            status=msg.get("status", "UNKNOWN"),
-            attachments=msg.get("attachments"),
-            error=msg.get("error"),
+            content=d["content"],
+            status=d["status"],
+            attachments=d["attachments"],
+            error=None,
         )
-    except GenieAPIError as e:
-        raise HTTPException(status_code=e.status_code, detail=e.detail)
+    except Exception as e:
+        logger.error(f"Genie get_message error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get(
@@ -292,31 +310,39 @@ async def get_query_result(
     conversation_id: str,
     message_id: str,
     attachment_id: str,
-    request: Request,
-    config: Dependencies.Config,
-    headers: Dependencies.Headers,
+    user_ws: Dependencies.UserClient,
 ):
-    token = _require_token(headers, request)
-    workspace_url = _get_workspace_url(config, headers)
-    svc = GenieService(workspace_url=workspace_url, user_token=token)
-
+    """Get query result for a completed message attachment."""
     try:
-        result = await svc.get_query_result(
-            space_id, conversation_id, message_id, attachment_id
+        result = await _run_sync(
+            user_ws.genie.get_message_query_result_by_attachment,
+            space_id,
+            conversation_id,
+            message_id,
+            attachment_id,
         )
-        columns = result.get("manifest", {}).get("schema", {}).get("columns", [])
-        rows_data = result.get("result", {}).get("data_array", [])
-        row_count = result.get("row_count") or len(rows_data)
-        truncated = result.get("truncated", False)
+        columns = []
+        rows = []
+        if result.statement_response:
+            manifest = result.statement_response.manifest
+            if manifest and manifest.schema and manifest.schema.columns:
+                columns = [
+                    {"name": c.name, "type": c.type_name.value if c.type_name else ""}
+                    for c in manifest.schema.columns
+                ]
+            chunk = result.statement_response.result
+            if chunk and chunk.data_array:
+                rows = chunk.data_array
 
         return GenieQueryResultOut(
-            columns=[{"name": c.get("name"), "type": c.get("type_name")} for c in columns],
-            rows=rows_data,
-            row_count=row_count,
-            truncated=truncated,
+            columns=columns,
+            rows=rows,
+            row_count=len(rows),
+            truncated=False,
         )
-    except GenieAPIError as e:
-        raise HTTPException(status_code=e.status_code, detail=e.detail)
+    except Exception as e:
+        logger.error(f"Genie get_query_result error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # --- Queue Management ---
@@ -353,7 +379,6 @@ async def get_queue_stats(request: Request):
 
 @router.delete("/queue/clear", response_model=ClearQueueOut, operation_id="clearQueue")
 async def clear_queue(request: Request):
-    """Delete all queue items."""
     qs = _get_queue_service(request)
     count = qs.clear_queue()
     return ClearQueueOut(deleted_count=count)
@@ -377,13 +402,13 @@ async def simulate_queue(
     request: Request,
     config: Dependencies.Config,
     headers: Dependencies.Headers,
+    user_ws: Dependencies.UserClient,
 ):
     """Simulate queuing multiple requests across Genie spaces."""
-    token = _require_token(headers, request)
+    token = headers.token.get_secret_value() if headers.token else ""
     workspace_url = _get_workspace_url(config, headers)
     qs = _get_queue_service(request)
 
-    # Resolve space IDs
     space_ids: list[str] = []
     if body.space_ids:
         space_ids = body.space_ids
@@ -392,16 +417,15 @@ async def simulate_queue(
     else:
         raise HTTPException(status_code=400, detail="Provide space_id or space_ids")
 
-    # Fetch space names for display
-    svc = GenieService(workspace_url=workspace_url, user_token=token)
+    # Fetch space names using the user's identity
     space_names: dict[str, str] = {}
     try:
-        raw_spaces = await svc.list_spaces()
-        for s in raw_spaces:
-            sid = s.get("space_id") or s.get("id", "")
-            space_names[sid] = s.get("title", s.get("name", "Untitled"))
-    except GenieAPIError:
-        pass  # names are optional, proceed without them
+        result = await _run_sync(user_ws.genie.list_spaces)
+        for s in result.spaces or []:
+            if s.space_id:
+                space_names[s.space_id] = s.title or "Untitled"
+    except Exception:
+        pass
 
     items = qs.simulate_enqueue(
         space_ids=space_ids,

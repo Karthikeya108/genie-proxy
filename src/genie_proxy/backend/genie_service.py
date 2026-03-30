@@ -66,6 +66,9 @@ class GenieService:
             raise GenieAPIError(response.status_code, body)
 
         if response.status_code >= 400:
+            logger.error(
+                f"Genie API {method} {path} returned {response.status_code}: {response.text[:500]}"
+            )
             raise GenieAPIError(response.status_code, response.text)
 
         return response.json()

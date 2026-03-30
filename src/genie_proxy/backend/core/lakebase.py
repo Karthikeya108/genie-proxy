@@ -10,7 +10,7 @@ from typing import Annotated, Any, AsyncGenerator, TypeAlias
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.errors import NotFound
 from fastapi import FastAPI, Request
-from pydantic import Field
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import Engine, create_engine, event
 from sqlmodel import Session, SQLModel, text
@@ -29,10 +29,19 @@ class DatabaseConfig(BaseSettings):
         description="The port of the database", default=5432, validation_alias="PGPORT"
     )
     database_name: str = Field(
-        description="The name of the database", default="databricks_postgres"
+        description="The name of the database",
+        default="genie_proxy_db",
+        validation_alias="LAKEBASE_DATABASE_NAME",
     )
     instance_name: str = Field(
-        description="The name of the database instance", validation_alias="PGAPPNAME"
+        description=(
+            "Lakebase provisioned database instance name (SDK: get_database_instance). "
+            "Do not use PGAPPNAME for this — Databricks sets PGAPPNAME to the app name."
+        ),
+        validation_alias=AliasChoices(
+            "LAKEBASE_INSTANCE_NAME",
+            "GENIE_PROXY_LAKEBASE_INSTANCE_NAME",
+        ),
     )
 
 
@@ -101,7 +110,9 @@ def create_db_engine(db_config: DatabaseConfig, ws: WorkspaceClient) -> Engine:
     return engine
 
 
-def validate_db(engine: Engine, db_config: DatabaseConfig) -> None:
+def validate_db(
+    engine: Engine, db_config: DatabaseConfig, ws: WorkspaceClient
+) -> None:
     """Validate that the database connection works."""
     dev_port = _get_dev_db_port()
 
@@ -112,7 +123,6 @@ def validate_db(engine: Engine, db_config: DatabaseConfig) -> None:
             f"Validating database connection to instance {db_config.instance_name}"
         )
         try:
-            ws = WorkspaceClient()
             ws.database.get_database_instance(db_config.instance_name)
         except NotFound:
             raise ValueError(
@@ -154,7 +164,7 @@ class _LakebaseDependency(LifespanDependency):
         ws = app.state.workspace_client
 
         engine = create_db_engine(db_config, ws)
-        validate_db(engine, db_config)
+        validate_db(engine, db_config, ws)
         initialize_models(engine)
 
         app.state.engine = engine

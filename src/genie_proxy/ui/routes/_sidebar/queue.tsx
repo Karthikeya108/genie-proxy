@@ -1,5 +1,5 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import {
   useListQueue,
   useGetQueueStats,
@@ -82,8 +82,41 @@ function StatusBadge({ status }: { status: string }) {
   );
 }
 
+function useElapsedMs(sinceIso: string | null | undefined, active: boolean): number | null {
+  const [elapsed, setElapsed] = useState<number | null>(null);
+  useEffect(() => {
+    if (!sinceIso || !active) {
+      setElapsed(null);
+      return;
+    }
+    const origin = new Date(sinceIso).getTime();
+    const tick = () => setElapsed(Date.now() - origin);
+    tick();
+    const id = setInterval(tick, 1000);
+    return () => clearInterval(id);
+  }, [sinceIso, active]);
+  return elapsed;
+}
+
 function QueueItemRow({ item }: { item: QueueItemOut }) {
   const [expanded, setExpanded] = useState(false);
+
+  // Live wait time: ticks while status is "pending" (since created_at)
+  const liveWaitMs = useElapsedMs(item.created_at, item.status === "pending");
+  // Live run time: ticks while status is "processing" (since started_at)
+  const liveRunMs = useElapsedMs(item.started_at, item.status === "processing");
+
+  // For pending: show live wait, no run time
+  // For processing: show final wait (from server), show live run
+  // For completed/failed: show final wait and run from server
+  const displayWaitMs =
+    item.status === "pending"
+      ? liveWaitMs
+      : item.wait_time_ms;
+  const displayRunMs =
+    item.status === "processing"
+      ? liveRunMs
+      : item.run_time_ms;
 
   return (
     <div className="border rounded-lg p-4 space-y-2">
@@ -99,16 +132,16 @@ function QueueItemRow({ item }: { item: QueueItemOut }) {
           <p className="text-sm font-medium truncate">{item.question}</p>
         </div>
         <div className="flex items-center gap-3 flex-shrink-0 text-xs text-muted-foreground">
-          {item.wait_time_ms != null && (
+          {displayWaitMs != null && (
             <span className="flex items-center gap-1" title="Wait time">
               <Hourglass className="h-3 w-3" />
-              {formatDuration(item.wait_time_ms)}
+              {formatDuration(displayWaitMs)}
             </span>
           )}
-          {item.run_time_ms != null && (
+          {displayRunMs != null && (
             <span className="flex items-center gap-1" title="Run time">
               <Timer className="h-3 w-3" />
-              {formatDuration(item.run_time_ms)}
+              {formatDuration(displayRunMs)}
             </span>
           )}
           <Button

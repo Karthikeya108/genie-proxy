@@ -62,5 +62,14 @@ ehthumbs.db
 # Logs
 *.log
 
-# Claude plans (local only)
-.claude/plans/
+# Claude
+.claude/
+
+# uv lock
+uv.lock
+
+# APX build output
+.build/
+
+# TanStack generated route tree
+src/genie_proxy/ui/types/routeTree.gen.ts

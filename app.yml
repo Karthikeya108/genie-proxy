@@ -1,1 +1,9 @@
 command: ["uvicorn", "genie_proxy.backend.app:app", "--workers", "2"]
+env:
+  - name: "GENIE_PROXY_WORKSPACE_URL"
+    value: "https://adb-4116661263058619.19.azuredatabricks.net"
+  - name: "GENIE_PROXY_GENIE_SPACE_IDS"
+    value: ""
+  # Lakebase provisioned instance name for SDK (not PGAPPNAME — the platform sets that to the app name)
+  - name: "LAKEBASE_INSTANCE_NAME"
+    value: "demo-instance"

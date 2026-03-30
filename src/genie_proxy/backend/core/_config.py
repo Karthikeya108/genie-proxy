@@ -54,3 +54,9 @@ class AppConfig(BaseSettings):
 # --- Logger ---
 
 logger = logging.getLogger(app_name)
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setLevel(logging.INFO)
+    _handler.setFormatter(logging.Formatter("%(name)s - %(levelname)s - %(message)s"))
+    logger.addHandler(_handler)

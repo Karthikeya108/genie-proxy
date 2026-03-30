@@ -12,15 +12,30 @@ artifacts:
 resources:
   apps:
     genie-proxy-app:
-      name: "genie-proxy"
+      name: "genie-proxy-app"
       description: "Genie Proxy - Access Databricks Genie Spaces across workspaces with intelligent QPM request queuing backed by Lakebase"
       source_code_path: ./.build
+      user_api_scopes:
+        - sql
+        - dashboards.genie
+        - serving.serving-endpoints
       resources:
         - name: "db"
           database:
-            database_name: "databricks_postgres"
-            instance_name: "demo-instance"
+            database_name: "genie_proxy_db"
+            instance_name: ${var.lakebase_instance_name}
             permission: "CAN_CONNECT_AND_CREATE"
+
+variables:
+  workspace_url:
+    description: "Databricks workspace URL for Genie API calls"
+    default: "https://adb-4116661263058619.19.azuredatabricks.net"
+  lakebase_instance_name:
+    description: "Lakebase database instance name"
+    default: "demo-instance"
+  genie_space_ids:
+    description: "Comma-separated Genie Space IDs to expose (empty = all accessible)"
+    default: ""
 
 targets:
   dev:
